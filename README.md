@@ -277,7 +277,7 @@ clearml-init
 | 2_hands | 0 | Две руки |
 | fist | 1 | Кулак |
 | normal_hand | 2 | Обычная рука |
-| pinch | 3 | Щепотка |
+| pinch | 3 | Пинч |
 | pointer | 4 | Указательный палец |
 
 
