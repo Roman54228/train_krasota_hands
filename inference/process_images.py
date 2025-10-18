@@ -97,6 +97,9 @@ def process_images_from_folder(input_folder, output_folder=None, depth_folder=No
     CROP_SIZE = 256
     map_colors = {0: (255,0,0), 1: (255,128,0), 2: (102,255,255), 3: (153,0,153), 4: (178,102,55)}
     
+    # YOLO классификация рук
+    yolo_classes = {1: 'hand_l', 0: 'hand_r', 2: 'twohands'}
+    
     # Обработка каждого изображения
     for img_idx, image_path in enumerate(image_files):
         print(f"Обработка {img_idx + 1}/{len(image_files)}: {os.path.basename(image_path)}")
@@ -132,6 +135,10 @@ def process_images_from_folder(input_folder, output_folder=None, depth_folder=No
         for i, box in enumerate(results[0].boxes.xyxy[:batch_size]):
             x1, y1, x2, y2 = map(int, box.tolist())
             cls = int(results[0].boxes.cls[i].item())
+            yolo_confidence = float(results[0].boxes.conf[i].item())
+            
+            # Получаем название класса YOLO
+            yolo_class_name = yolo_classes.get(cls, f'unknown_{cls}')
             
             cropped_hand = image[y1:y2, x1:x2]
             list_src_crops.append(cropped_hand)
@@ -165,6 +172,9 @@ def process_images_from_folder(input_folder, output_folder=None, depth_folder=No
             for j, pt in enumerate(pts):
                 sender.send(address=f"/bboxes/bbox_{i}/point_{j}", data=[pt[0], pt[1], pt[2]])
             
+            # Отправка YOLO классификации
+            sender.send(address=f"/bboxes/bbox_{i}/yolo_class", data=[cls, yolo_confidence, yolo_class_name])
+            
             track_id = 0
         
         # Если нет детекций, пропускаем
@@ -185,6 +195,10 @@ def process_images_from_folder(input_folder, output_folder=None, depth_folder=No
         # Отрисовка результатов
         for i, box in enumerate(results[0].boxes.xyxy[:batch_size]):
             x1, y1, x2, y2 = map(int, box.tolist())
+            yolo_cls = int(results[0].boxes.cls[i].item())
+            yolo_conf = float(results[0].boxes.conf[i].item())
+            yolo_class_name = yolo_classes.get(yolo_cls, f'unknown_{yolo_cls}')
+            
             label = cls_output[i].argmax()
             confidence = float(cls_output[i].max())
             color = map_colors[label]
@@ -250,8 +264,12 @@ def process_images_from_folder(input_folder, output_folder=None, depth_folder=No
             
             # Рисуем bounding box
             cv2.rectangle(draw_image, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(draw_image, f'id:{track_id} class:{label} conf:{confidence:.2f}', (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            
+            # Отображаем информацию о YOLO классификации и жесте
+            cv2.putText(draw_image, f'YOLO: {yolo_class_name} ({yolo_conf:.2f})', (x1, y1 - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            cv2.putText(draw_image, f'Gesture: {label} ({confidence:.2f})', (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         
         # Сохранение результата
         output_path = os.path.join(output_folder, os.path.basename(image_path))
