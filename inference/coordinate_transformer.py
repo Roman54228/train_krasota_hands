@@ -28,10 +28,10 @@ class CoordinateTransformer:
         # Параметры дисторсии
         self.dist = np.array([-0.2333385, 0.102841, -0.017275, 0.000101, 0.000010])
         
-        self.height = 0.93
+        self.height = 1.77
         
         # Угол наклона камеры (в радианах)
-        self.alpha = np.deg2rad(6)
+        self.alpha = np.deg2rad(61)
         
         # Матрица гомографии
         self.H = self._calculate_homography()
@@ -86,10 +86,22 @@ class CoordinateTransformer:
         # Устранение дисторсии
         pixel = np.array([[u, v]], dtype=np.float64)
         pixel = pixel.reshape(-1, 1, 2)
+        # pixel_undistorted = cv2.undistortPoints(pixel, self.K, self.dist, P=self.K)
+        # pixel_norm = cv2.undistortPoints(pixel, self.K, self.dist)  
         pixel_undistorted = cv2.undistortPoints(pixel, self.K, self.dist, P=self.K)
         u_undist, v_undist = pixel_undistorted[0][0]
 
+
+        # x_norm, y_norm = pixel_norm[0][0]
+
+        # print(f"pixel_norm {pixel_norm}, {u,v,z}")
+        
+        # # x_norm, y_norm = pixel_undistorted[0][0]
+        # x_norm, y_norm = pixel_norm[0][0]
+        
         # Преобразование нормализованных координат в 3D координаты камеры
+        # x_cam = (u - cx) * z / fx
+        # y_cam = (v - cy) * z / fy
         fx, fy = self.K[0, 0], self.K[1, 1]
         cx, cy = self.K[0, 2], self.K[1, 2]
         x_cam = (u_undist - cx) / fx
@@ -100,7 +112,27 @@ class CoordinateTransformer:
         y_cam = y_cam * scale
         z_cam = scale
                 
+        # Z_cam = z / np.sqrt(x_norm**2 + y_norm**2 + 1.0)
+
+        # x_cam = x_norm * Z_cam
+        # y_cam = y_norm * Z_cam
         return x_cam, y_cam, z_cam
+        # x_cam = (x_norm - cx) * z / fx
+        # y_cam = (y_norm - cy) * z / fy
+        
+        # 3D точка в системе координат камеры
+        # point_cam = np.array([x_cam, y_cam, Z_cam])
+        # # return x_cam, y_cam, z
+        
+        # # Преобразование в мировые координаты
+        # # world = R^T * (point_cam - t)
+        # R = self.RT[:, :3]  # Матрица поворота
+        # t = self.RT[:, 3]   # Вектор трансляции
+        
+        # # Обратное преобразование: world = R^T * point_cam - R^T * t
+        # world = R.T @ point_cam - R.T @ t
+        
+        # return world[0], world[1], world[2]
     
     def pixel_to_world(self, u: float, v: float, z: Optional[float] = None) -> Tuple[float, float]:
         """Преобразование пиксельных координат в мировые
@@ -147,9 +179,27 @@ class CoordinateTransformer:
             - X, Y - координаты на плоскости пола
             - Z - высота точки над полом
         """
+        # Матрица поворота для наклона камеры вниз на угол alpha
         cos_alpha = np.cos(self.alpha)
         sin_alpha = np.sin(self.alpha)
         
+        # # Поворот вокруг оси X (наклон вниз)
+        # R = np.array([[1, 0, 0],
+        #               [0, cos_alpha, -sin_alpha],
+        #               [0, sin_alpha, cos_alpha]], dtype=np.float64)
+        
+        # # Точка в системе координат камеры
+        # point_cam = np.array([x_cam, y_cam, z_cam])
+        
+        # # Поворачиваем точку
+        # point_rotated = R @ point_cam
+        
+        # # Смещаем на высоту камеры
+        # x_floor = point_rotated[0]
+        # y_floor = point_rotated[2] 
+        # z_floor = point_rotated[1]# + self.height
+        
+        # return x_floor, y_floor, z_floor
         y_rot = y_cam * cos_alpha + z_cam * sin_alpha   # вертикальное смещение вниз
         z_rot = -y_cam * sin_alpha + z_cam * cos_alpha  # горизонтальное вперёд
         

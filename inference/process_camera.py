@@ -74,13 +74,13 @@ class CameraProcessor:
         
         # ToF параметры
         self.TOF_PARAMS = {
-            "ToF::StreamFps": 5,
+            "ToF::StreamFps": 100,
             "ToF::Distance": 7.5,
-            "ToF::Exposure": 5.6,
+            "ToF::Exposure": 0.15,
             "ToF::DepthMedianBlur": 0,
-            "ToF::DepthFlyingPixelRemoval": 1,
-            "ToF::Threshold": 100,
-            "ToF::Gain": 2,
+            "ToF::DepthFlyingPixelRemoval": 2,
+            "ToF::Threshold": 40,
+            "ToF::Gain": 9,
             "ToF::AutoExposure": 0,
             "ToF::DepthSmoothStrength": 0,
             "ToF::DepthCompletion": 0,
@@ -182,9 +182,11 @@ class CameraProcessor:
     
     def process_frame(self, image, depth=None):
         """Обработка одного кадра"""
-        # Обработка изображения (если оно в оттенках серого - конвертируем в BGR)
-        if len(image.shape) == 2:
-            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        # Обработка изображения как в latest.py
+        ir_image_8bit = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
+        _, ir_image_8bit = cv2.threshold(ir_image_8bit, 10, 60, cv2.THRESH_TOZERO)
+        image = np.copy(ir_image_8bit)
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         
         draw_image = image.copy()
         image_h, image_w = image.shape[:2]
@@ -195,23 +197,15 @@ class CameraProcessor:
         list_src_crops, resized_crops = [], []
         detections = []
         
-        batch_size = 1
-        # Обработка детекций
-        for i, box in enumerate(results[0].boxes.xyxy[:batch_size]):
+        # Обработка детекций (как в latest.py - до 2 детекций)
+        for i, box in enumerate(results[0].boxes.xyxy[:2]):
             x1, y1, x2, y2 = map(int, box.tolist())
             cls = int(results[0].boxes.cls[i].item())
-            yolo_confidence = float(results[0].boxes.conf[i].item())
-            
-            # Получаем название класса YOLO
-            yolo_class_name = self.yolo_classes.get(cls, f'unknown_{cls}')
             
             cropped_hand = image[y1:y2, x1:x2]
             list_src_crops.append(cropped_hand)
             cropped_resized = cv2.resize(cropped_hand, (self.CROP_SIZE, self.CROP_SIZE))
             resized_crops.append(cropped_resized)
-            
-            # Сохраняем текущую детекцию
-            current_detection = [x1, y1, x2, y2]
             
             # Расширяем бокс на 1%
             x1_smooth, y1_smooth, x2_smooth, y2_smooth = x1, y1, x2, y2
@@ -220,8 +214,8 @@ class CameraProcessor:
             
             x1_smooth = max(0, x1_smooth - expand_width)
             y1_smooth = max(0, y1_smooth - expand_height)
-            x2_smooth = min(image_w, x2_smooth + expand_width)
-            y2_smooth = min(image_h, y2_smooth + expand_height)
+            x2_smooth += expand_width
+            y2_smooth += expand_height
             
             z = float(0)
             pt_tl = [float(x1_smooth), float(y1_smooth), z]
@@ -235,12 +229,8 @@ class CameraProcessor:
             
             pts = (pt_ct, pt_tl, pt_tr, pt_bl, pt_br)
             for j, pt in enumerate(pts):
+                print(j, pt[0], pt[1], pt[2])
                 self.sender.send(address=f"/bboxes/bbox_{i}/point_{j}", data=[pt[0], pt[1], pt[2]])
-            
-            # Отправка YOLO классификации
-            self.sender.send(address=f"/bboxes/bbox_{i}/yolo_class", data=[cls, yolo_confidence, yolo_class_name])
-            
-            track_id = 0
         
         # Если нет детекций, возвращаем оригинальное изображение
         if len(list_src_crops) == 0:
@@ -253,24 +243,16 @@ class CameraProcessor:
         
         cls_output = run_model_batch(resized_crops, self.trt_model, image_size=256)[0]
         
-        # Отрисовка результатов
-        for i, box in enumerate(results[0].boxes.xyxy[:batch_size]):
+        # Отрисовка результатов (как в latest.py)
+        for i, box in enumerate(results[0].boxes.xyxy[:2]):
             x1, y1, x2, y2 = map(int, box.tolist())
-            yolo_cls = int(results[0].boxes.cls[i].item())
-            yolo_conf = float(results[0].boxes.conf[i].item())
-            yolo_class_name = self.yolo_classes.get(yolo_cls, f'unknown_{yolo_cls}')
-            
             label = cls_output[i].argmax()
-            confidence = float(cls_output[i].max())
             color = self.map_colors[label]
             
             preds = np.expand_dims(kps_preds[i], 0)[:, :, :2] * 256
             preds = preds[0]
             h, w, _ = list_src_crops[i].shape
             points = []
-            
-            # Подготовка keypoints для отправки (21 точка с 3D координатами)
-            keypoints_3d = np.zeros((21, 3))
             
             for p_id, (x_norm, y_norm) in enumerate(preds):
                 x_norm, y_norm = x_norm / self.CROP_SIZE, y_norm / self.CROP_SIZE
@@ -279,35 +261,26 @@ class CameraProcessor:
                 abs_px = x1 + px
                 abs_py = y1 + py
                 
-                # Получаем глубину для keypoint
-                z = 0
-                if depth is not None and 0 <= abs_py < depth.shape[0] and 0 <= abs_px < depth.shape[1]:
-                    raw_depth = depth[abs_py, abs_px]
-                    z = self.calculate_depth_distance(raw_depth)
-                
-                # Сохраняем 3D координаты keypoint
-                keypoints_3d[p_id] = [abs_px, abs_py, z]
-                
                 if p_id == 0:
                     my_x, my_y = abs_px, abs_py
-                    cv2.circle(draw_image, (my_x, my_y), 3, (0, 255, 0), -1)
-                    
-                    # Координаты в мировой системе (если есть depth)
-                    if z > 0:
-                        real_x, real_y, real_z = self.coord_transformer.pixel_to_floor_3d(my_x, my_y, z)
-                        cv2.putText(draw_image, f'{real_x:.1f} {real_y:.1f} {real_z:.2f}', (50, 50),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    z = 0
+                    if depth is not None and 0 <= my_y < depth.shape[0] and 0 <= my_x < depth.shape[1]:
+                        z = depth[my_y, my_x] * (7.5/65536)
+                    cv2.circle(draw_image, (my_x, my_y), 1, (0, 255, 0), -1)
+                    my_x_normal = 640 - 1 - my_x
+                    my_y_normal = 480 - 1 - my_y
+                    real_x, real_y, real_z = self.coord_transformer.pixel_to_floor_3d(my_x_normal, my_y_normal, z)
+                    cv2.putText(draw_image, f'{real_x:.3f} {real_y:.3f}, {real_z:.3f}, {z:.3f}', (my_x, my_y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
                 points.append((abs_px, abs_py))
-                cv2.circle(draw_image, (abs_px, abs_py), 2, (0, 255, 0), -1)
-            
-            # Отправка результатов через OSC
-            self.sender.send_hand_detection(
-                bbox_id=i,
-                gesture_class=int(label),
-                confidence=confidence,
-                keypoints=keypoints_3d
-            )
+                if p_id == 8 or p_id == 4:
+                    if p_id == 8:
+                        p8 = px, py
+                    if p_id == 4:
+                        p4 = px, py
+                    color = (117, 0, 178)
+                cv2.circle(draw_image, (abs_px, abs_py), 1, (0, 255, 0), -1)
             
             # Рисуем соединения между keypoints
             connections = [
@@ -319,19 +292,16 @@ class CameraProcessor:
                 (0,5),(5,9),(9,13),(13,17),(0,17)
             ]
             for start_idx, end_idx in connections:
-                if start_idx < len(points) and end_idx < len(points):
-                    start = points[start_idx]
-                    end = points[end_idx]
-                    cv2.line(draw_image, start, end, (0, 255, 0), thickness=2)
+                start = points[start_idx]
+                end = points[end_idx]
+                cv2.line(draw_image, start, end, (0, 255, 0), thickness=1)
             
-            # Рисуем bounding box
+            # Рисуем линию и bounding box
+            cv2.line(draw_image, (0, 550), (550, 550), color, 2)
             cv2.rectangle(draw_image, (x1, y1), (x2, y2), color, 2)
-            
-            # Отображаем информацию о YOLO классификации и жесте
-            cv2.putText(draw_image, f'YOLO: {yolo_class_name} ({yolo_conf:.2f})', (x1, y1 - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-            cv2.putText(draw_image, f'Gesture: {label} ({confidence:.2f})', (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            track_id = 0
+            cv2.putText(draw_image, f'id:{track_id}', (x1, y1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         return draw_image, list_src_crops
     
@@ -389,6 +359,12 @@ class CameraProcessor:
             
             print("Нажмите 'q' для выхода")
             
+            # Инициализация FPS
+            previousTime_FPS = 0
+            currentTime_FPS = 0
+            startTime = time.time()
+            jjj = 0
+            
             # Основной цикл обработки
             while True:
                 # Получение кадров из ToF потока
@@ -400,17 +376,30 @@ class CameraProcessor:
                         break
                     continue
                 
-                # Обработка кадров
-                ir_frame = images[1]
-                depth_frame = images[0]
-                ir_processed = cv2.flip(ir_frame, -1)
-                depth_processed = cv2.flip(depth_frame, -1)
+                # Обработка кадров (как в latest.py)
+                image = images[1]
+                depth = images[0]
+                cv2.imwrite('temp.png', depth)
+                
+                # Обработка изображения
+                ir_image_8bit = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
+                _, ir_image_8bit = cv2.threshold(ir_image_8bit, 10, 60, cv2.THRESH_TOZERO)
+                image = np.copy(ir_image_8bit)
+                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                draw_image = image.copy()
+                jjj += 1
+                
+                # Пропускаем кадры (как в latest.py)
+                if jjj % 8 != 0:
+                    continue
                 
                 # Обработка кадра
-                processed_image, crops = self.process_frame(ir_processed, depth_processed)
+                processed_image, crops = self.process_frame(image, depth)
                 
                 # Отображение результата
                 cv2.imshow("Hand Detection", processed_image)
+                cv2.imshow("Depth", depth)
+                cv2.imwrite(f'roma_images/{jjj}.png', processed_image)
                 
                 # Проверка на выход
                 if cv2.waitKey(1) & 0xFF == ord('q'):
