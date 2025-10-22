@@ -206,6 +206,9 @@ class CameraProcessor:
             x1, y1, x2, y2 = map(int, box.tolist())
             cls = int(results[0].boxes.cls[i].item())
             
+            # Получаем название класса
+            yolo_class_name = self.yolo_classes.get(cls, f'unknown_{cls}')
+            
             cropped_hand = image[y1:y2, x1:x2]
             list_src_crops.append(cropped_hand)
             cropped_resized = cv2.resize(cropped_hand, (self.CROP_SIZE, self.CROP_SIZE))
@@ -235,6 +238,9 @@ class CameraProcessor:
             for j, pt in enumerate(pts):
                 print(j, pt[0], pt[1], pt[2])
                 self.sender.send(address=f"/bboxes/bbox_{i}/point_{j}", data=[pt[0], pt[1], pt[2]])
+            
+            # Отправка информации о классе детекции
+            self.sender.send(address=f"/hand_{yolo_class_name}/class", data=[cls, yolo_class_name])
         
         # Если нет детекций, возвращаем оригинальное изображение
         if len(list_src_crops) == 0:
@@ -250,6 +256,9 @@ class CameraProcessor:
         # Отрисовка результатов (как в latest.py)
         for i, box in enumerate(results[0].boxes.xyxy[:2]):
             x1, y1, x2, y2 = map(int, box.tolist())
+            yolo_cls = int(results[0].boxes.cls[i].item())
+            yolo_class_name = self.yolo_classes.get(yolo_cls, f'unknown_{yolo_cls}')
+            
             label = cls_output[i].argmax()
             color = self.map_colors[label]
             
@@ -299,6 +308,30 @@ class CameraProcessor:
                 start = points[start_idx]
                 end = points[end_idx]
                 cv2.line(draw_image, start, end, (0, 255, 0), thickness=1)
+            
+            # Отправка каждой keypoint отдельно с 3D координатами
+            for p_id, (x_norm, y_norm) in enumerate(preds):
+                x_norm, y_norm = x_norm / self.CROP_SIZE, y_norm / self.CROP_SIZE
+                px = int(x_norm * w)
+                py = int(y_norm * h)
+                abs_px = x1 + px
+                abs_py = y1 + py
+                
+                # Получаем глубину для keypoint
+                z = 0
+                if depth is not None and 0 <= abs_py < depth.shape[0] and 0 <= abs_px < depth.shape[1]:
+                    z = depth[abs_py, abs_px] * (7.5/65536)
+                
+                # Нормализуем координаты
+                my_x_normal = 640 - 1 - abs_px
+                my_y_normal = 480 - 1 - abs_py
+                real_x, real_y, real_z = self.coord_transformer.pixel_to_floor_3d(my_x_normal, my_y_normal, z)
+                
+                # Отправка каждой keypoint отдельно с классом руки
+                self.sender.send(address=f"/hand_{yolo_class_name}/keypoint_{p_id}", data=[real_x, real_y, real_z])
+            
+            # Отправка информации о жесте
+            self.sender.send(address=f"/hand_{yolo_class_name}/gesture", data=[int(label), float(cls_output[i].max())])
             
             # Рисуем линию и bounding box
             cv2.line(draw_image, (0, 550), (550, 550), color, 2)
@@ -385,16 +418,6 @@ class CameraProcessor:
                 depth = images[0]
                 cv2.imwrite('temp.png', depth)
                 
-                # Обработка изображения
-                if len(image.shape) == 2:  # Если изображение в оттенках серого
-                    ir_image_8bit = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
-                    _, ir_image_8bit = cv2.threshold(ir_image_8bit, 10, 60, cv2.THRESH_TOZERO)
-                    image = np.copy(ir_image_8bit)
-                    image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-                else:  # Если изображение уже в цвете
-                    image = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
-                    _, image = cv2.threshold(image, 10, 60, cv2.THRESH_TOZERO)
-                draw_image = image.copy()
                 jjj += 1
                 
                 # Пропускаем кадры (как в latest.py)
@@ -406,7 +429,18 @@ class CameraProcessor:
                 
                 # Отображение результата
                 cv2.imshow("Hand Detection", processed_image)
-                cv2.imshow("Depth", depth)
+                
+                # Показываем оригинальное изображение
+                if len(image.shape) == 2:
+                    cv2.imshow("Original IR", image)
+                else:
+                    cv2.imshow("Original IR", cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+                
+                # Нормализация depth для визуализации
+                if depth is not None:
+                    depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                    cv2.imshow("Depth", depth_normalized)
+                
                 cv2.imwrite(f'roma_images/{jjj}.png', processed_image)
                 
                 # Проверка на выход
