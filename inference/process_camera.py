@@ -183,10 +183,14 @@ class CameraProcessor:
     def process_frame(self, image, depth=None):
         """Обработка одного кадра"""
         # Обработка изображения как в latest.py
-        ir_image_8bit = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
-        _, ir_image_8bit = cv2.threshold(ir_image_8bit, 10, 60, cv2.THRESH_TOZERO)
-        image = np.copy(ir_image_8bit)
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        if len(image.shape) == 2:  # Если изображение в оттенках серого
+            ir_image_8bit = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
+            _, ir_image_8bit = cv2.threshold(ir_image_8bit, 10, 60, cv2.THRESH_TOZERO)
+            image = np.copy(ir_image_8bit)
+            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        else:  # Если изображение уже в цвете
+            image = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
+            _, image = cv2.threshold(image, 10, 60, cv2.THRESH_TOZERO)
         
         draw_image = image.copy()
         image_h, image_w = image.shape[:2]
@@ -382,10 +386,14 @@ class CameraProcessor:
                 cv2.imwrite('temp.png', depth)
                 
                 # Обработка изображения
-                ir_image_8bit = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
-                _, ir_image_8bit = cv2.threshold(ir_image_8bit, 10, 60, cv2.THRESH_TOZERO)
-                image = np.copy(ir_image_8bit)
-                image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                if len(image.shape) == 2:  # Если изображение в оттенках серого
+                    ir_image_8bit = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
+                    _, ir_image_8bit = cv2.threshold(ir_image_8bit, 10, 60, cv2.THRESH_TOZERO)
+                    image = np.copy(ir_image_8bit)
+                    image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                else:  # Если изображение уже в цвете
+                    image = cv2.convertScaleAbs(image, alpha=self.DEPTH_SCALE_ALPHA)
+                    _, image = cv2.threshold(image, 10, 60, cv2.THRESH_TOZERO)
                 draw_image = image.copy()
                 jjj += 1
                 
