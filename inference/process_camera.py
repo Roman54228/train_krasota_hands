@@ -65,12 +65,19 @@ class CameraProcessor:
         # Создание словаря для хранения предыдущих детекций каждого трека
         self.previous_detections = defaultdict(list)
         
+        # Система трекинга рук
+        self.hand_tracks = {}  # {track_id: {'hand_type': 'left'/'right'/'twohands', 'confidence_history': [], 'frames_count': 0}}
+        self.next_track_id = 0
+        self.min_frames_for_stable_classification = 5  # Минимум кадров для стабильной классификации
+        self.max_confidence_history = 10  # Максимум кадров истории для усреднения
+        
         # Параметры обработки
         self.CROP_SIZE = 256
         self.map_colors = {0: (255,0,0), 1: (255,128,0), 2: (102,255,255), 3: (153,0,153), 4: (178,102,55)}
         
         # YOLO классификация рук
-        self.yolo_classes = {1: 'hand_l', 0: 'hand_r', 2: 'twohands'}
+        # Попробуем разные маппинги в зависимости от того, что возвращает YOLO
+        self.yolo_classes = {0: 'hand_l', 1: 'hand_r', 2: 'twohands'}  # Альтернативный маппинг
         
         # ToF параметры
         self.TOF_PARAMS = {
@@ -106,6 +113,101 @@ class CameraProcessor:
         # Сглаживание: берём среднее значение последних 2 детекций
         smoothed_box = np.mean(self.previous_detections[track_id], axis=0).astype(int)
         return smoothed_box
+    
+    def assign_track_id(self, detection_box, yolo_class):
+        """Назначение track_id для новой детекции"""
+        # Простая логика назначения ID на основе позиции и класса
+        # В реальном проекте здесь должен быть более сложный трекинг
+        
+        # Проверяем существующие треки
+        for track_id, track_info in self.hand_tracks.items():
+            if track_info['frames_count'] > 0:  # Трек активен
+                # Простая проверка пересечения боксов (можно улучшить)
+                # Пока используем простую логику - если трек недавно был активен, используем его ID
+                if track_info['frames_count'] < 10:  # Трек недавно активен
+                    return track_id
+        
+        # Создаем новый трек
+        track_id = self.next_track_id
+        self.next_track_id += 1
+        return track_id
+    
+    def update_hand_track(self, track_id, yolo_class, confidence):
+        """Обновление информации о треке руки"""
+        if track_id not in self.hand_tracks:
+            self.hand_tracks[track_id] = {
+                'hand_type': None,
+                'confidence_history': [],
+                'frames_count': 0,
+                'stable_classification': None
+            }
+        
+        track_info = self.hand_tracks[track_id]
+        
+        # Добавляем текущую классификацию в историю
+        track_info['confidence_history'].append((yolo_class, confidence))
+        track_info['frames_count'] += 1
+        
+        # Ограничиваем историю
+        if len(track_info['confidence_history']) > self.max_confidence_history:
+            track_info['confidence_history'].pop(0)
+        
+        # Определяем стабильную классификацию
+        if len(track_info['confidence_history']) >= self.min_frames_for_stable_classification:
+            # Подсчитываем наиболее частый класс за последние кадры
+            recent_classes = [cls for cls, conf in track_info['confidence_history'][-self.min_frames_for_stable_classification:]]
+            most_common_class = max(set(recent_classes), key=recent_classes.count)
+            
+            # Проверяем стабильность (минимум 70% кадров должны быть одного класса)
+            stability_ratio = recent_classes.count(most_common_class) / len(recent_classes)
+            if stability_ratio >= 0.7:
+                track_info['stable_classification'] = most_common_class
+                track_info['hand_type'] = self.yolo_classes.get(most_common_class, f'unknown_{most_common_class}')
+    
+    def resolve_hand_conflicts(self, detections):
+        """Разрешение конфликтов: не более одной левой и одной правой руки в кадре"""
+        if len(detections) <= 1:
+            return detections
+        
+        # Проверяем детекции по типам
+        left_hands = [d for d in detections if d['yolo_class'] == 0]  # hand_l
+        right_hands = [d for d in detections if d['yolo_class'] == 1]  # hand_r
+        two_hands = [d for d in detections if d['yolo_class'] == 2]   # twohands
+        
+        # Конфликт: несколько левых рук
+        if len(left_hands) > 1:
+            print(f"DEBUG: Обнаружено {len(left_hands)} левых рук, оставляем одну с наибольшей уверенностью")
+            # Оставляем только одну левую руку с наибольшей уверенностью
+            best_left = max(left_hands, key=lambda d: d['confidence'])
+            detections = [d for d in detections if d['yolo_class'] != 0 or d == best_left]
+        
+        # Конфликт: несколько правых рук
+        if len(right_hands) > 1:
+            print(f"DEBUG: Обнаружено {len(right_hands)} правых рук, оставляем одну с наибольшей уверенностью")
+            # Оставляем только одну правую руку с наибольшей уверенностью
+            best_right = max(right_hands, key=lambda d: d['confidence'])
+            detections = [d for d in detections if d['yolo_class'] != 1 or d == best_right]
+        
+        # Конфликт: несколько "двух рук"
+        if len(two_hands) > 1:
+            print(f"DEBUG: Обнаружено {len(two_hands)} детекций 'двух рук', оставляем одну с наибольшей уверенностью")
+            # Оставляем только одну детекцию "двух рук" с наибольшей уверенностью
+            best_two_hands = max(two_hands, key=lambda d: d['confidence'])
+            detections = [d for d in detections if d['yolo_class'] != 2 or d == best_two_hands]
+        
+        return detections
+    
+    def cleanup_inactive_tracks(self):
+        """Очистка неактивных треков"""
+        inactive_tracks = []
+        for track_id, track_info in self.hand_tracks.items():
+            if track_info['frames_count'] > 20:  # Трек неактивен более 20 кадров
+                inactive_tracks.append(track_id)
+        
+        for track_id in inactive_tracks:
+            del self.hand_tracks[track_id]
+            if track_id in self.previous_detections:
+                del self.previous_detections[track_id]
     
     def extract_camera_intrinsics(self, stream):
         """Извлечение параметров камеры"""
@@ -198,16 +300,64 @@ class CameraProcessor:
         # Инференс YOLO
         results = self.model.predict(image)
         
+        # DEBUG: Проверяем, что возвращает YOLO модель
+        if len(results[0].boxes) > 0:
+            print(f"DEBUG: YOLO detected {len(results[0].boxes)} objects")
+            for i, cls in enumerate(results[0].boxes.cls):
+                print(f"DEBUG: Object {i}: class {int(cls.item())}")
+        else:
+            print("DEBUG: No objects detected by YOLO")
+        
         list_src_crops, resized_crops = [], []
         detections = []
         
-        # Обработка детекций (как в latest.py - до 2 детекций)
+        # Собираем все детекции с информацией о треках
         for i, box in enumerate(results[0].boxes.xyxy[:2]):
             x1, y1, x2, y2 = map(int, box.tolist())
             cls = int(results[0].boxes.cls[i].item())
+            confidence = float(results[0].boxes.conf[i].item())
             
-            # Получаем название класса
-            yolo_class_name = self.yolo_classes.get(cls, f'unknown_{cls}')
+            # Назначаем track_id
+            track_id = self.assign_track_id(box.tolist(), cls)
+            
+            # Обновляем информацию о треке
+            self.update_hand_track(track_id, cls, confidence)
+            
+            # Добавляем детекцию в список
+            detections.append({
+                'box': [x1, y1, x2, y2],
+                'yolo_class': cls,
+                'confidence': confidence,
+                'track_id': track_id,
+                'index': i
+            })
+        
+        # Разрешаем конфликты между левой и правой рукой
+        detections = self.resolve_hand_conflicts(detections)
+        
+        # Очищаем неактивные треки
+        self.cleanup_inactive_tracks()
+        
+        # Обрабатываем финальные детекции
+        for detection in detections:
+            x1, y1, x2, y2 = detection['box']
+            cls = detection['yolo_class']
+            track_id = detection['track_id']
+            i = detection['index']
+            
+            # Получаем стабильную классификацию или используем текущую
+            track_info = self.hand_tracks.get(track_id, {})
+            stable_class = track_info.get('stable_classification', cls)
+            
+            # DEBUG: Выводим информацию о классе
+            print(f"DEBUG: Track {track_id} - YOLO class: {cls}, Stable class: {stable_class}")
+            print(f"DEBUG: Track frames count: {track_info.get('frames_count', 0)}")
+            
+            # Используем стабильную классификацию если она есть
+            final_class = stable_class if stable_class is not None else cls
+            yolo_class_name = self.yolo_classes.get(final_class, f'unknown_{final_class}')
+            
+            print(f"DEBUG: Final class: {final_class}, Mapped to: {yolo_class_name}")
             
             cropped_hand = image[y1:y2, x1:x2]
             list_src_crops.append(cropped_hand)
@@ -240,7 +390,7 @@ class CameraProcessor:
                 self.sender.send(address=f"/bboxes/bbox_{i}/point_{j}", data=[pt[0], pt[1], pt[2]])
             
             # Отправка информации о классе детекции
-            self.sender.send(address=f"/hand_{yolo_class_name}/class", data=[cls, yolo_class_name])
+            self.sender.send(address=f"/hand_{yolo_class_name}/class", data=[final_class, yolo_class_name])
         
         # Если нет детекций, возвращаем оригинальное изображение
         if len(list_src_crops) == 0:
@@ -254,10 +404,18 @@ class CameraProcessor:
         cls_output = run_model_batch(resized_crops, self.trt_model, image_size=256)[0]
         
         # Отрисовка результатов (как в latest.py)
-        for i, box in enumerate(results[0].boxes.xyxy[:2]):
-            x1, y1, x2, y2 = map(int, box.tolist())
-            yolo_cls = int(results[0].boxes.cls[i].item())
-            yolo_class_name = self.yolo_classes.get(yolo_cls, f'unknown_{yolo_cls}')
+        for i, detection in enumerate(detections):
+            x1, y1, x2, y2 = detection['box']
+            track_id = detection['track_id']
+            
+            # Получаем стабильную классификацию или используем текущую
+            track_info = self.hand_tracks.get(track_id, {})
+            stable_class = track_info.get('stable_classification', detection['yolo_class'])
+            final_class = stable_class if stable_class is not None else detection['yolo_class']
+            yolo_class_name = self.yolo_classes.get(final_class, f'unknown_{final_class}')
+            
+            # DEBUG: Выводим информацию о классе во второй части
+            print(f"DEBUG (second part): Track {track_id} - Final class: {final_class}, mapped to: {yolo_class_name}")
             
             label = cls_output[i].argmax()
             color = self.map_colors[label]
@@ -336,7 +494,6 @@ class CameraProcessor:
             # Рисуем линию и bounding box
             cv2.line(draw_image, (0, 550), (550, 550), color, 2)
             cv2.rectangle(draw_image, (x1, y1), (x2, y2), color, 2)
-            track_id = 0
             cv2.putText(draw_image, f'id:{track_id}', (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
