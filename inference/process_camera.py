@@ -27,7 +27,7 @@ import cv2
 import torch
 from collections import defaultdict
 import os
-
+DEPTH_LEN = 2.5
 # Импорт внешних модулей
 from coordinate_transformer import CoordinateTransformer
 from osc_sender import Sender
@@ -82,9 +82,10 @@ class CameraProcessor:
         self.yolo_classes = {0: 'hand_l', 1: 'hand_r', 2: 'twohands'}  # Альтернативный маппинг
         
         # ToF параметры
+        DEPTH_LEN = 2.5
         self.TOF_PARAMS = {
             "ToF::StreamFps": 100,
-            "ToF::Distance": 7.5,
+            "ToF::Distance": DEPTH_LEN,
             "ToF::Exposure": 0.15,
             "ToF::DepthMedianBlur": 0,
             "ToF::DepthFlyingPixelRemoval": 2,
@@ -99,7 +100,7 @@ class CameraProcessor:
         self.DEPTH_SCALE_ALPHA = 2000.0 / 60000.0
         self.RAW_DEPTH_MULTIPLIER = 2
         self.MAX_DEPTH_VALUE = 65535.0
-        self.DEFAULT_TOF_RANGE_M = 7.5
+        self.DEFAULT_TOF_RANGE_M = DEPTH_LEN
         
         print("Инициализация завершена")
     
@@ -378,19 +379,19 @@ class CameraProcessor:
             hull = cv2.convexHull(points)
             cv2.fillPoly(mask, [hull], 255)
             
-            # Сильно расширяем маску для захвата всей области
-            kernel = np.ones((7, 7), np.uint8)
-            mask = cv2.dilate(mask, kernel, iterations=3)
+            # Немного расширяем маску для захвата всей области
+            kernel = np.ones((20, 20), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=2)
             
             # Находим области в маске где depth == 0 или слишком большой (пол)
             # Используем reference_depth как ориентир
             if reference_depth > 0:
-                # Считаем что значения отличающиеся от reference_depth больше чем на 0.3м это пол
-                depth_meters = depth * (7.5/65536)
+                # Считаем что значения отличающиеся от reference_depth больше чем на 0.2м это пол
+                depth_meters = depth * (DEPTH_LEN/65536)
                 
                 # Создаем маску плохих точек (слишком далеко от reference_depth или == 0)
                 bad_depth_mask = np.zeros_like(mask)
-                bad_depth_mask[(depth_meters == 0) | (np.abs(depth_meters - reference_depth) > 0.3)] = 255
+                bad_depth_mask[(depth_meters == 0) | (np.abs(depth_meters - reference_depth) > 0.2)] = 255
                 
                 # Применяем маску руки - интересуют только плохие точки внутри руки
                 bad_depth_mask = cv2.bitwise_and(bad_depth_mask, mask)
@@ -400,21 +401,16 @@ class CameraProcessor:
                 
                 # Если есть плохие точки, интерполируем
                 if np.any(bad_depth_mask > 0) and np.any(good_depth_mask > 0):
-                    # Используем inpaint с большим радиусом для лучшего заполнения
+                    # Используем inpaint для заполнения плохих областей
                     depth_float = depth.astype(np.float32)
-                    depth_inpainted = cv2.inpaint(depth_float, bad_depth_mask, inpaintRadius=15, flags=cv2.INPAINT_TELEA)
+                    depth_inpainted = cv2.inpaint(depth_float, bad_depth_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
                     
                     # Применяем результат только в области руки
                     depth_copy = np.where(mask > 0, depth_inpainted, depth_copy)
                     
-                    # Сильное сглаживание в области руки (несколько проходов)
-                    for _ in range(2):
-                        depth_copy_smoothed = cv2.GaussianBlur(depth_copy, (9, 9), 0)
-                        depth_copy = np.where(mask > 0, depth_copy_smoothed, depth_copy)
-                    
-                    # Дополнительное bilateral filtering для сохранения краев но сглаживания шума
-                    depth_copy = cv2.bilateralFilter(depth_copy.astype(np.float32), d=9, sigmaColor=75, sigmaSpace=75)
-                    depth_copy = depth_copy.astype(depth.dtype)
+                    # Сглаживаем результат в области руки
+                    depth_copy_smoothed = cv2.GaussianBlur(depth_copy, (5, 5), 0)
+                    depth_copy = np.where(mask > 0, depth_copy_smoothed, depth_copy)
         
         return depth_copy.astype(depth.dtype), mask, hull
     
@@ -569,7 +565,7 @@ class CameraProcessor:
                 # Получаем reference depth от точки p_id == 0 (основание ладони)
                 if p_id == 0 and depth is not None:
                     if 0 <= abs_py < depth.shape[0] and 0 <= abs_px < depth.shape[1]:
-                        reference_depth = depth[abs_py, abs_px] * (7.5/65536)
+                        reference_depth = depth[abs_py, abs_px] * (DEPTH_LEN/65536)
             
             hands_data.append({
                 'detection': detection,
@@ -631,7 +627,7 @@ class CameraProcessor:
                     my_x, my_y = abs_px, abs_py
                     z = 0
                     if interpolated_depth is not None and 0 <= my_y < interpolated_depth.shape[0] and 0 <= my_x < interpolated_depth.shape[1]:
-                        z = interpolated_depth[my_y, my_x] * (7.5/65536)
+                        z = interpolated_depth[my_y, my_x] * (DEPTH_LEN/65536)
                     cv2.circle(draw_image, (my_x, my_y), 1, (0, 255, 0), -1)
                     my_x_normal = 640 - 1 - my_x
                     my_y_normal = 480 - 1 - my_y
@@ -673,7 +669,7 @@ class CameraProcessor:
                 # Получаем глубину для keypoint (используем интерполированный depth)
                 z = 0
                 if interpolated_depth is not None and 0 <= abs_py < interpolated_depth.shape[0] and 0 <= abs_px < interpolated_depth.shape[1]:
-                    z = interpolated_depth[abs_py, abs_px] * (7.5/65536)
+                    z = interpolated_depth[abs_py, abs_px] * (DEPTH_LEN/65536)
                 
                 # Нормализуем координаты
                 my_x_normal = 640 - 1 - abs_px
