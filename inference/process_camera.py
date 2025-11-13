@@ -358,10 +358,10 @@ class CameraProcessor:
             reference_depth: опорное значение depth (от точки p_id == 0)
         
         Returns:
-            depth карта с интерполированными значениями в области руки
+            tuple: (depth карта с интерполированными значениями, маска области интерполяции, convex hull)
         """
         if depth is None or len(keypoints) == 0:
-            return depth
+            return depth, None, None
         
         depth_copy = depth.copy()
         h, w = depth.shape[:2]
@@ -372,6 +372,7 @@ class CameraProcessor:
         # Конвертируем keypoints в формат для cv2.fillPoly
         points = np.array(keypoints, dtype=np.int32)
         
+        hull = None
         # Создаем выпуклую оболочку (convex hull) вокруг всех keypoints
         if len(points) >= 3:
             hull = cv2.convexHull(points)
@@ -384,7 +385,7 @@ class CameraProcessor:
             # Находим области в маске где depth == 0 или слишком большой (пол)
             # Используем reference_depth как ориентир
             if reference_depth > 0:
-                # Считаем что значения отличающиеся от reference_depth больше чем на 0.5м это пол
+                # Считаем что значения отличающиеся от reference_depth больше чем на 0.2м это пол
                 depth_meters = depth * (7.5/65536)
                 
                 # Создаем маску плохих точек (слишком далеко от reference_depth или == 0)
@@ -410,7 +411,7 @@ class CameraProcessor:
                     depth_copy_smoothed = cv2.GaussianBlur(depth_copy, (5, 5), 0)
                     depth_copy = np.where(mask > 0, depth_copy_smoothed, depth_copy)
         
-        return depth_copy.astype(depth.dtype)
+        return depth_copy.astype(depth.dtype), mask, hull
     
     def process_frame(self, image, depth=None):
         """Обработка одного кадра"""
@@ -530,7 +531,7 @@ class CameraProcessor:
         
         # Если нет детекций, возвращаем оригинальное изображение
         if len(list_src_crops) == 0:
-            return draw_image, []
+            return draw_image, [], None
         
         # Предсказание keypoints и классификация
         with torch.no_grad():
@@ -574,17 +575,23 @@ class CameraProcessor:
                 'crop_w': w
             })
         
-        # Интерполируем depth для каждоend(address=f"/hand_{yolo_class_name}/keypoint_{p_id}", data=[real_x, real_y, real_z])
-                # if p_id == 3:й руки
+        # Интерполируем depth для каждой руки
         interpolated_depth = depth.copy() if depth is not None else None
+        interpolation_masks = []  # Маски областей интерполяции для визуализации
+        interpolation_hulls = []  # Convex hulls для визуализации
+        
         if interpolated_depth is not None:
             for hand_data in hands_data:
                 if hand_data['reference_depth'] > 0:
-                    interpolated_depth = self.interpolate_hand_depth(
+                    interpolated_depth, mask, hull = self.interpolate_hand_depth(
                         interpolated_depth,
                         hand_data['keypoints'],
                         hand_data['reference_depth']
                     )
+                    if mask is not None:
+                        interpolation_masks.append(mask)
+                    if hull is not None:
+                        interpolation_hulls.append(hull)
         
         # Второй проход: отрисовка результатов с интерполированным depth
         for i, hand_data in enumerate(hands_data):
@@ -685,7 +692,27 @@ class CameraProcessor:
             cv2.putText(draw_image, f'id:{track_id}, {detection['yolo_class']}', (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
-        return draw_image, list_src_crops
+        # Визуализация областей интерполяции
+        if len(interpolation_hulls) > 0:
+            # Создаем полупрозрачный оверлей для областей интерполяции
+            overlay = draw_image.copy()
+            
+            for i, hull in enumerate(interpolation_hulls):
+                # Рисуем заполненный hull полупрозрачным цветом
+                cv2.fillPoly(overlay, [hull], (0, 255, 255))  # Желтый цвет для области
+                
+                # Рисуем контур hull
+                cv2.polylines(draw_image, [hull], True, (0, 255, 255), 2)
+            
+            # Смешиваем оверлей с основным изображением (30% прозрачность)
+            alpha = 0.3
+            draw_image = cv2.addWeighted(overlay, alpha, draw_image, 1 - alpha, 0)
+            
+            # Добавляем текст с пояснением
+            cv2.putText(draw_image, 'Yellow: Interpolation area', (10, image_h - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        
+        return draw_image, list_src_crops, interpolated_depth
     
     def find_tof_stream(self, device):
         """Поиск ToF потока"""
@@ -770,21 +797,29 @@ class CameraProcessor:
                     continue
                 
                 # Обработка кадра
-                processed_image, crops = self.process_frame(image, depth)
+                processed_image, crops, interpolated_depth = self.process_frame(image, depth)
                 
                 # Отображение результата
                 cv2.imshow("Hand Detection", processed_image)
                 
-                # # Показываем оригинальное изображение
-                # if len(image.shape) == 2:
-                #     cv2.imshow("Original IR", image)
-                # else:
-                #     cv2.imshow("Original IR", cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+                # Показываем оригинальное изображение
+                if len(image.shape) == 2:
+                    cv2.imshow("Original IR", image)
+                else:
+                    cv2.imshow("Original IR", cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
                 
-                # # Нормализация depth для визуализации
-                # if depth is not None:
-                #     depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-                #     cv2.imshow("Depth", depth_normalized)
+                # Нормализация depth для визуализации
+                if depth is not None:
+                    # Оригинальный depth
+                    depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                    depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+                    cv2.imshow("Depth Original", depth_colored)
+                    
+                    # Интерполированный depth
+                    if interpolated_depth is not None:
+                        depth_interpolated_normalized = cv2.normalize(interpolated_depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                        depth_interpolated_colored = cv2.applyColorMap(depth_interpolated_normalized, cv2.COLORMAP_JET)
+                        cv2.imshow("Depth Interpolated", depth_interpolated_colored)
                 
                 cv2.imwrite(f'roma_images/{jjj}.png', processed_image)
                 
