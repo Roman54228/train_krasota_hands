@@ -46,12 +46,17 @@ class CameraProcessor:
     """Основной класс для обработки видео с камеры"""
     
     def __init__(self, yolo_model_path: str, trt_model_path: str, kps_model_path: str, 
-                 osc_ip: str = "10.0.0.101", osc_port: int = 5055):
+                 osc_ip: str = "10.0.0.101", osc_port: int = 5055, 
+                 use_depth_interpolation: bool = True):
         # Инициализация координатного трансформера
         self.coord_transformer = CoordinateTransformer()
         
         # Инициализация OSC отправителя
         self.sender = Sender(ip=osc_ip, port=osc_port, logging_level="DEBUG")
+        
+        # Флаг использования интерполяции depth
+        self.use_depth_interpolation = use_depth_interpolation
+        print(f"Depth interpolation: {'enabled' if use_depth_interpolation else 'disabled'}")
         
         # Загрузка моделей
         print("Загрузка YOLO модели...")
@@ -576,12 +581,12 @@ class CameraProcessor:
                 'crop_w': w
             })
         
-        # Интерполируем depth для каждой руки
+        # Интерполируем depth для каждой руки (если включено)
         interpolated_depth = depth.copy() if depth is not None else None
         interpolation_masks = []  # Маски областей интерполяции для визуализации
         interpolation_hulls = []  # Convex hulls для визуализации
         
-        if interpolated_depth is not None:
+        if self.use_depth_interpolation and interpolated_depth is not None:
             for hand_data in hands_data:
                 if hand_data['reference_depth'] > 0:
                     interpolated_depth, mask, hull = self.interpolate_hand_depth(
@@ -593,6 +598,9 @@ class CameraProcessor:
                         interpolation_masks.append(mask)
                     if hull is not None:
                         interpolation_hulls.append(hull)
+        
+        # Выбираем какой depth использовать
+        final_depth = interpolated_depth if self.use_depth_interpolation else depth
         
         # Второй проход: отрисовка результатов с интерполированным depth
         for i, hand_data in enumerate(hands_data):
@@ -626,8 +634,8 @@ class CameraProcessor:
                 if p_id == 0:
                     my_x, my_y = abs_px, abs_py
                     z = 0
-                    if interpolated_depth is not None and 0 <= my_y < interpolated_depth.shape[0] and 0 <= my_x < interpolated_depth.shape[1]:
-                        z = interpolated_depth[my_y, my_x] * (DEPTH_LEN/65536)
+                    if final_depth is not None and 0 <= my_y < final_depth.shape[0] and 0 <= my_x < final_depth.shape[1]:
+                        z = final_depth[my_y, my_x] * (DEPTH_LEN/65536)
                     cv2.circle(draw_image, (my_x, my_y), 1, (0, 255, 0), -1)
                     my_x_normal = 640 - 1 - my_x
                     my_y_normal = 480 - 1 - my_y
@@ -666,10 +674,10 @@ class CameraProcessor:
                 abs_px = x1 + px
                 abs_py = y1 + py
                 
-                # Получаем глубину для keypoint (используем интерполированный depth)
+                # Получаем глубину для keypoint (используем выбранный depth)
                 z = 0
-                if interpolated_depth is not None and 0 <= abs_py < interpolated_depth.shape[0] and 0 <= abs_px < interpolated_depth.shape[1]:
-                    z = interpolated_depth[abs_py, abs_px] * (DEPTH_LEN/65536)
+                if final_depth is not None and 0 <= abs_py < final_depth.shape[0] and 0 <= abs_px < final_depth.shape[1]:
+                    z = final_depth[abs_py, abs_px] * (DEPTH_LEN/65536)
                 
                 # Нормализуем координаты
                 my_x_normal = 640 - 1 - abs_px
@@ -693,8 +701,8 @@ class CameraProcessor:
             cv2.putText(draw_image, f'id:{track_id}, {detection['yolo_class']}', (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
-        # Визуализация областей интерполяции
-        if len(interpolation_hulls) > 0:
+        # Визуализация областей интерполяции (только если включено)
+        if self.use_depth_interpolation and len(interpolation_hulls) > 0:
             # Создаем полупрозрачный оверлей для областей интерполяции
             overlay = draw_image.copy()
             
@@ -710,8 +718,13 @@ class CameraProcessor:
             draw_image = cv2.addWeighted(overlay, alpha, draw_image, 1 - alpha, 0)
             
             # Добавляем текст с пояснением
-            cv2.putText(draw_image, 'Yellow: Interpolation area', (10, image_h - 10),
+            cv2.putText(draw_image, 'Yellow: Interpolation area (ON)', (10, image_h - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        else:
+            # Показываем что интерполяция выключена
+            if not self.use_depth_interpolation:
+                cv2.putText(draw_image, 'Depth interpolation: OFF', (10, image_h - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
         
         return draw_image, list_src_crops, interpolated_depth
     
@@ -816,8 +829,8 @@ class CameraProcessor:
                     depth_colored = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
                     cv2.imshow("Depth Original", depth_colored)
                     
-                    # Интерполированный depth
-                    if interpolated_depth is not None:
+                    # Интерполированный depth (только если включено)
+                    if self.use_depth_interpolation and interpolated_depth is not None:
                         depth_interpolated_normalized = cv2.normalize(interpolated_depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
                         depth_interpolated_colored = cv2.applyColorMap(depth_interpolated_normalized, cv2.COLORMAP_JET)
                         cv2.imshow("Depth Interpolated", depth_interpolated_colored)
@@ -848,6 +861,8 @@ def main():
                         help='IP адрес для OSC отправки')
     parser.add_argument('--osc-port', type=int, default=5055,
                         help='Порт для OSC отправки')
+    parser.add_argument('--no-depth-interpolation', action='store_true',
+                        help='Отключить интерполяцию depth (по умолчанию включена)')
     
     args = parser.parse_args()
     
@@ -857,7 +872,8 @@ def main():
         trt_model_path=args.trt,
         kps_model_path=args.kps,
         osc_ip=args.osc_ip,
-        osc_port=args.osc_port
+        osc_port=args.osc_port,
+        use_depth_interpolation=not args.no_depth_interpolation
     )
     
     # Запуск обработки
