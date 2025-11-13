@@ -378,19 +378,19 @@ class CameraProcessor:
             hull = cv2.convexHull(points)
             cv2.fillPoly(mask, [hull], 255)
             
-            # Немного расширяем маску для захвата всей области
-            kernel = np.ones((5, 5), np.uint8)
-            mask = cv2.dilate(mask, kernel, iterations=2)
+            # Сильно расширяем маску для захвата всей области
+            kernel = np.ones((7, 7), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=3)
             
             # Находим области в маске где depth == 0 или слишком большой (пол)
             # Используем reference_depth как ориентир
             if reference_depth > 0:
-                # Считаем что значения отличающиеся от reference_depth больше чем на 0.2м это пол
+                # Считаем что значения отличающиеся от reference_depth больше чем на 0.3м это пол
                 depth_meters = depth * (7.5/65536)
                 
                 # Создаем маску плохих точек (слишком далеко от reference_depth или == 0)
                 bad_depth_mask = np.zeros_like(mask)
-                bad_depth_mask[(depth_meters == 0) | (np.abs(depth_meters - reference_depth) > 0.2)] = 255
+                bad_depth_mask[(depth_meters == 0) | (np.abs(depth_meters - reference_depth) > 0.3)] = 255
                 
                 # Применяем маску руки - интересуют только плохие точки внутри руки
                 bad_depth_mask = cv2.bitwise_and(bad_depth_mask, mask)
@@ -400,16 +400,21 @@ class CameraProcessor:
                 
                 # Если есть плохие точки, интерполируем
                 if np.any(bad_depth_mask > 0) and np.any(good_depth_mask > 0):
-                    # Используем inpaint для заполнения плохих областей
+                    # Используем inpaint с большим радиусом для лучшего заполнения
                     depth_float = depth.astype(np.float32)
-                    depth_inpainted = cv2.inpaint(depth_float, bad_depth_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+                    depth_inpainted = cv2.inpaint(depth_float, bad_depth_mask, inpaintRadius=15, flags=cv2.INPAINT_TELEA)
                     
                     # Применяем результат только в области руки
                     depth_copy = np.where(mask > 0, depth_inpainted, depth_copy)
                     
-                    # Сглаживаем результат в области руки
-                    depth_copy_smoothed = cv2.GaussianBlur(depth_copy, (5, 5), 0)
-                    depth_copy = np.where(mask > 0, depth_copy_smoothed, depth_copy)
+                    # Сильное сглаживание в области руки (несколько проходов)
+                    for _ in range(2):
+                        depth_copy_smoothed = cv2.GaussianBlur(depth_copy, (9, 9), 0)
+                        depth_copy = np.where(mask > 0, depth_copy_smoothed, depth_copy)
+                    
+                    # Дополнительное bilateral filtering для сохранения краев но сглаживания шума
+                    depth_copy = cv2.bilateralFilter(depth_copy.astype(np.float32), d=9, sigmaColor=75, sigmaSpace=75)
+                    depth_copy = depth_copy.astype(depth.dtype)
         
         return depth_copy.astype(depth.dtype), mask, hull
     
