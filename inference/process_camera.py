@@ -423,123 +423,98 @@ class CameraProcessor:
         
         return depth_copy.astype(depth.dtype), mask, hull
     
-    def interpolate_hand_depth_skeleton(self, depth, keypoints, keypoints_depth_values):
+    def interpolate_hand_depth_skeleton(self, depth, keypoints, keypoints_depth_values, bbox, reference_depth):
         """
-        Интерполяция depth вдоль скелета руки (метод 2: skeleton dilation)
+        Интерполяция depth через thresholding и dilation (метод 2)
         
-        Расширяет depth значения вдоль всех соединений скелета руки,
-        заполняя промежутки между пальцами.
+        Использует depth thresholding внутри bounding box для получения точной маски руки,
+        затем расширяет её и заполняет новыми depth значениями.
         
         Args:
             depth: depth карта
             keypoints: список координат keypoints [(x, y), ...] (21 точка)
             keypoints_depth_values: список depth значений для каждой keypoint
+            bbox: bounding box руки [x1, y1, x2, y2]
+            reference_depth: опорное значение depth (от точки p_id == 0) в метрах
         
         Returns:
-            tuple: (depth карта с интерполированными значениями, маска скелета)
+            tuple: (depth карта с интерполированными значениями, маска руки)
         """
-        if depth is None or len(keypoints) == 0 or len(keypoints) != 21:
+        if depth is None or len(keypoints) == 0 or reference_depth <= 0:
             return depth, None
         
         depth_copy = depth.copy().astype(np.float32)
         h, w = depth.shape[:2]
         
-        # Создаем маску для скелета
-        skeleton_mask = np.zeros((h, w), dtype=np.uint8)
+        x1, y1, x2, y2 = bbox
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
         
-        # Создаем depth карту для скелета
-        skeleton_depth = np.zeros((h, w), dtype=np.float32)
+        # Конвертируем depth в метры
+        depth_meters = depth.astype(np.float32) * (DEPTH_LEN / 65536)
         
-        # Соединения скелета руки (21 точка)
-        connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4),      # Большой палец
-            (0, 5), (5, 6), (6, 7), (7, 8),      # Указательный
-            (0, 9), (9, 10), (10, 11), (11, 12), # Средний
-            (0, 13), (13, 14), (14, 15), (15, 16), # Безымянный
-            (0, 17), (17, 18), (18, 19), (19, 20), # Мизинец
-            (5, 9), (9, 13), (13, 17)            # Соединения между пальцами
-        ]
+        # Создаем маску руки через thresholding внутри bbox
+        hand_mask = np.zeros((h, w), dtype=np.uint8)
         
-        # Рисуем толстые линии вдоль скелета с depth значениями
-        line_thickness = 12  # Толщина линий для "раздувания" руки
+        # Thresholding: берем depth близкий к reference_depth (±30 см)
+        threshold_range = 0.3  # 30 см
         
-        for start_idx, end_idx in connections:
-            if start_idx < len(keypoints) and end_idx < len(keypoints):
-                pt1 = keypoints[start_idx]
-                pt2 = keypoints[end_idx]
-                
-                # Проверяем что точки валидны
-                if (0 <= pt1[0] < w and 0 <= pt1[1] < h and 
-                    0 <= pt2[0] < w and 0 <= pt2[1] < h):
-                    
-                    # Рисуем толстую линию на маске
-                    cv2.line(skeleton_mask, pt1, pt2, 255, thickness=line_thickness)
-                    
-                    # Интерполируем depth значения вдоль линии
-                    depth_start = keypoints_depth_values[start_idx]
-                    depth_end = keypoints_depth_values[end_idx]
-                    
-                    # Создаем временную маску для этой линии
-                    temp_mask = np.zeros((h, w), dtype=np.uint8)
-                    cv2.line(temp_mask, pt1, pt2, 255, thickness=line_thickness)
-                    
-                    # Заполняем depth значения вдоль линии с линейной интерполяцией
-                    line_pixels = np.where(temp_mask > 0)
-                    if len(line_pixels[0]) > 0:
-                        for y, x in zip(line_pixels[0], line_pixels[1]):
-                            # Вычисляем расстояние от start к end
-                            total_dist = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
-                            if total_dist > 0:
-                                current_dist = np.sqrt((x - pt1[0])**2 + (y - pt1[1])**2)
-                                t = current_dist / total_dist  # 0 в start, 1 в end
-                                
-                                # Линейная интерполяция depth
-                                interpolated_depth = depth_start * (1 - t) + depth_end * t
-                                
-                                # Обновляем только если это значение больше текущего (ближе к камере)
-                                if skeleton_depth[y, x] == 0 or interpolated_depth > skeleton_depth[y, x]:
-                                    skeleton_depth[y, x] = interpolated_depth
+        # Внутри bbox делаем thresholding
+        bbox_region = depth_meters[y1:y2, x1:x2]
+        valid_depth = (bbox_region > 0) & \
+                      (np.abs(bbox_region - reference_depth) < threshold_range)
         
-        # Рисуем круги в местах keypoints для большей толщины
-        for idx, (kp, depth_val) in enumerate(zip(keypoints, keypoints_depth_values)):
-            if 0 <= kp[0] < w and 0 <= kp[1] < h and depth_val > 0:
-                cv2.circle(skeleton_mask, kp, line_thickness // 2, 255, -1)
-                cv2.circle(skeleton_depth.astype(np.float32), kp, line_thickness // 2, float(depth_val), -1)
+        hand_mask[y1:y2, x1:x2] = (valid_depth * 255).astype(np.uint8)
         
-        # Расширяем скелет еще больше через dilation
-        kernel = np.ones((15, 15), np.uint8)
-        skeleton_mask_dilated = cv2.dilate(skeleton_mask, kernel, iterations=2)
+        # Морфологическая операция: closing (заполнение дыр)
+        kernel_close = np.ones((5, 5), np.uint8)
+        hand_mask = cv2.morphologyEx(hand_mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
         
-        # Заполняем расширенные области через inpainting
-        # Сначала создаем маску где нужно заполнить (расширенная область минус исходный скелет)
-        fill_mask = cv2.bitwise_and(skeleton_mask_dilated, cv2.bitwise_not(skeleton_mask))
+        # Удаляем мелкие шумы: opening
+        kernel_open = np.ones((3, 3), np.uint8)
+        hand_mask = cv2.morphologyEx(hand_mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
         
-        # Применяем скелетный depth к основной depth карте
+        # Находим самый большой контур (это должна быть рука)
+        contours, _ = cv2.findContours(hand_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) > 0:
+            # Берем самый большой контур
+            largest_contour = max(contours, key=cv2.contourArea)
+            
+            # Создаем чистую маску только с самым большим контуром
+            hand_mask_clean = np.zeros_like(hand_mask)
+            cv2.drawContours(hand_mask_clean, [largest_contour], -1, 255, -1)
+            hand_mask = hand_mask_clean
+        
+        # Сохраняем оригинальную маску
+        original_hand_mask = hand_mask.copy()
+        
+        # Расширяем маску через dilation для заполнения промежутков между пальцами
+        kernel_dilate = np.ones((20, 20), np.uint8)
+        hand_mask_dilated = cv2.dilate(hand_mask, kernel_dilate, iterations=2)
+        
+        # Создаем маску областей для заполнения (расширенная - оригинальная)
+        fill_mask = cv2.bitwise_and(hand_mask_dilated, cv2.bitwise_not(original_hand_mask))
+        
+        # Применяем оригинальные depth значения в области исходной маски
         depth_result = depth_copy.copy()
         
-        # В местах где есть скелет, используем интерполированные значения
-        skeleton_pixels = np.where(skeleton_mask > 0)
-        for y, x in zip(skeleton_pixels[0], skeleton_pixels[1]):
-            if skeleton_depth[y, x] > 0:
-                depth_result[y, x] = skeleton_depth[y, x]
-        
-        # Заполняем расширенные области через размытие
+        # Заполняем расширенные области через inpaint
         if np.any(fill_mask > 0):
-            # Конвертируем в правильный формат для inpaint
+            # Используем inpaint для плавного заполнения расширенных областей
             depth_for_inpaint = depth_result.astype(np.float32)
-            depth_inpainted = cv2.inpaint(depth_for_inpaint, fill_mask, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
+            depth_inpainted = cv2.inpaint(depth_for_inpaint, fill_mask, inpaintRadius=15, flags=cv2.INPAINT_TELEA)
             
-            # Применяем результат
-            fill_pixels = np.where(fill_mask > 0)
-            for y, x in zip(fill_pixels[0], fill_pixels[1]):
-                depth_result[y, x] = depth_inpainted[y, x]
+            # Применяем результат только в расширенной области
+            depth_result = np.where(fill_mask > 0, depth_inpainted, depth_result)
         
-        # Сглаживаем результат в области скелета
-        mask_for_blur = skeleton_mask_dilated
-        depth_smoothed = cv2.GaussianBlur(depth_result, (7, 7), 0)
-        depth_result = np.where(mask_for_blur > 0, depth_smoothed, depth_result)
+        # Сглаживаем результат во всей области руки (оригинальная + расширенная)
+        depth_smoothed = cv2.GaussianBlur(depth_result, (9, 9), 0)
+        depth_result = np.where(hand_mask_dilated > 0, depth_smoothed, depth_result)
         
-        return depth_result.astype(depth.dtype), skeleton_mask_dilated
+        # Дополнительное сглаживание bilateral filter для сохранения краев
+        depth_result_bilateral = cv2.bilateralFilter(depth_result.astype(np.float32), d=9, sigmaColor=75, sigmaSpace=75)
+        depth_result = np.where(hand_mask_dilated > 0, depth_result_bilateral, depth_result)
+        
+        return depth_result.astype(depth.dtype), hand_mask_dilated
     
     def process_frame(self, image, depth=None):
         """Обработка одного кадра"""
@@ -719,19 +694,23 @@ class CameraProcessor:
         if self.use_depth_interpolation and interpolated_depth is not None:
             for hand_data in hands_data:
                 if self.interpolation_method == "skeleton":
-                    # Метод 2: интерполяция вдоль скелета
-                    if len(hand_data['keypoints']) == 21:
+                    # Метод 2: интерполяция через depth thresholding и dilation
+                    if len(hand_data['keypoints']) == 21 and hand_data['reference_depth'] > 0:
+                        bbox = hand_data['detection']['box']
                         interpolated_depth, mask = self.interpolate_hand_depth_skeleton(
                             interpolated_depth,
                             hand_data['keypoints'],
-                            hand_data['keypoints_depth_values']
+                            hand_data['keypoints_depth_values'],
+                            bbox,
+                            hand_data['reference_depth']
                         )
                         if mask is not None:
                             interpolation_masks.append(mask)
-                            # Для визуализации создаем hull из keypoints
-                            kp_array = np.array(hand_data['keypoints'], dtype=np.int32)
-                            if len(kp_array) >= 3:
-                                hull = cv2.convexHull(kp_array)
+                            # Для визуализации создаем hull из маски
+                            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            if len(contours) > 0:
+                                largest_contour = max(contours, key=cv2.contourArea)
+                                hull = cv2.convexHull(largest_contour)
                                 interpolation_hulls.append(hull)
                 else:
                     # Метод 1: интерполяция через convex hull (по умолчанию)
