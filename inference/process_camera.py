@@ -348,6 +348,70 @@ class CameraProcessor:
         raw_scaled = raw_depth * self.RAW_DEPTH_MULTIPLIER
         return raw_scaled * (self.DEFAULT_TOF_RANGE_M / self.MAX_DEPTH_VALUE)
     
+    def interpolate_hand_depth(self, depth, keypoints, reference_depth):
+        """
+        Интерполяция depth в области руки
+        
+        Args:
+            depth: depth карта
+            keypoints: список координат keypoints [(x, y), ...]
+            reference_depth: опорное значение depth (от точки p_id == 0)
+        
+        Returns:
+            depth карта с интерполированными значениями в области руки
+        """
+        if depth is None or len(keypoints) == 0:
+            return depth
+        
+        depth_copy = depth.copy()
+        h, w = depth.shape[:2]
+        
+        # Создаем маску области руки из keypoints
+        mask = np.zeros((h, w), dtype=np.uint8)
+        
+        # Конвертируем keypoints в формат для cv2.fillPoly
+        points = np.array(keypoints, dtype=np.int32)
+        
+        # Создаем выпуклую оболочку (convex hull) вокруг всех keypoints
+        if len(points) >= 3:
+            hull = cv2.convexHull(points)
+            cv2.fillPoly(mask, [hull], 255)
+            
+            # Немного расширяем маску для захвата всей области
+            kernel = np.ones((5, 5), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=2)
+            
+            # Находим области в маске где depth == 0 или слишком большой (пол)
+            # Используем reference_depth как ориентир
+            if reference_depth > 0:
+                # Считаем что значения отличающиеся от reference_depth больше чем на 0.5м это пол
+                depth_meters = depth * (7.5/65536)
+                
+                # Создаем маску плохих точек (слишком далеко от reference_depth или == 0)
+                bad_depth_mask = np.zeros_like(mask)
+                bad_depth_mask[(depth_meters == 0) | (np.abs(depth_meters - reference_depth) > 0.2)] = 255
+                
+                # Применяем маску руки - интересуют только плохие точки внутри руки
+                bad_depth_mask = cv2.bitwise_and(bad_depth_mask, mask)
+                
+                # Создаем маску хороших точек в области руки
+                good_depth_mask = cv2.bitwise_and(mask, cv2.bitwise_not(bad_depth_mask))
+                
+                # Если есть плохие точки, интерполируем
+                if np.any(bad_depth_mask > 0) and np.any(good_depth_mask > 0):
+                    # Используем inpaint для заполнения плохих областей
+                    depth_float = depth.astype(np.float32)
+                    depth_inpainted = cv2.inpaint(depth_float, bad_depth_mask, inpaintRadius=5, flags=cv2.INPAINT_TELEA)
+                    
+                    # Применяем результат только в области руки
+                    depth_copy = np.where(mask > 0, depth_inpainted, depth_copy)
+                    
+                    # Сглаживаем результат в области руки
+                    depth_copy_smoothed = cv2.GaussianBlur(depth_copy, (5, 5), 0)
+                    depth_copy = np.where(mask > 0, depth_copy_smoothed, depth_copy)
+        
+        return depth_copy.astype(depth.dtype)
+    
     def process_frame(self, image, depth=None):
         """Обработка одного кадра"""
         # Обработка изображения как в latest.py
@@ -475,8 +539,55 @@ class CameraProcessor:
         
         cls_output = run_model_batch(resized_crops, self.trt_model, image_size=256)[0]
         
-        # Отрисовка результатов (как в latest.py)
+        # Первый проход: собираем все keypoints для каждой руки и получаем reference depth
+        hands_data = []
         for i, detection in enumerate(detections):
+            x1, y1, x2, y2 = detection['box']
+            
+            preds = np.expand_dims(kps_preds[i], 0)[:, :, :2] * 256
+            preds = preds[0]
+            h, w, _ = list_src_crops[i].shape
+            
+            # Собираем все абсолютные координаты keypoints
+            abs_keypoints = []
+            reference_depth = 0
+            
+            for p_id, (x_norm, y_norm) in enumerate(preds):
+                x_norm, y_norm = x_norm / self.CROP_SIZE, y_norm / self.CROP_SIZE
+                px = int(x_norm * w)
+                py = int(y_norm * h)
+                abs_px = x1 + px
+                abs_py = y1 + py
+                abs_keypoints.append((abs_px, abs_py))
+                
+                # Получаем reference depth от точки p_id == 0 (основание ладони)
+                if p_id == 0 and depth is not None:
+                    if 0 <= abs_py < depth.shape[0] and 0 <= abs_px < depth.shape[1]:
+                        reference_depth = depth[abs_py, abs_px] * (7.5/65536)
+            
+            hands_data.append({
+                'detection': detection,
+                'keypoints': abs_keypoints,
+                'reference_depth': reference_depth,
+                'preds': preds,
+                'crop_h': h,
+                'crop_w': w
+            })
+        
+        # Интерполируем depth для каждой руки
+        interpolated_depth = depth.copy() if depth is not None else None
+        if interpolated_depth is not None:
+            for hand_data in hands_data:
+                if hand_data['reference_depth'] > 0:
+                    interpolated_depth = self.interpolate_hand_depth(
+                        interpolated_depth,
+                        hand_data['keypoints'],
+                        hand_data['reference_depth']
+                    )
+        
+        # Второй проход: отрисовка результатов с интерполированным depth
+        for i, hand_data in enumerate(hands_data):
+            detection = hand_data['detection']
             x1, y1, x2, y2 = detection['box']
             track_id = detection['track_id']
             
@@ -492,9 +603,8 @@ class CameraProcessor:
             label = cls_output[i].argmax()
             color = self.map_colors[label]
             
-            preds = np.expand_dims(kps_preds[i], 0)[:, :, :2] * 256
-            preds = preds[0]
-            h, w, _ = list_src_crops[i].shape
+            preds = hand_data['preds']
+            h, w = hand_data['crop_h'], hand_data['crop_w']
             points = []
             
             for p_id, (x_norm, y_norm) in enumerate(preds):
@@ -507,8 +617,8 @@ class CameraProcessor:
                 if p_id == 0:
                     my_x, my_y = abs_px, abs_py
                     z = 0
-                    if depth is not None and 0 <= my_y < depth.shape[0] and 0 <= my_x < depth.shape[1]:
-                        z = depth[my_y, my_x] * (7.5/65536)
+                    if interpolated_depth is not None and 0 <= my_y < interpolated_depth.shape[0] and 0 <= my_x < interpolated_depth.shape[1]:
+                        z = interpolated_depth[my_y, my_x] * (7.5/65536)
                     cv2.circle(draw_image, (my_x, my_y), 1, (0, 255, 0), -1)
                     my_x_normal = 640 - 1 - my_x
                     my_y_normal = 480 - 1 - my_y
@@ -547,10 +657,10 @@ class CameraProcessor:
                 abs_px = x1 + px
                 abs_py = y1 + py
                 
-                # Получаем глубину для keypoint
+                # Получаем глубину для keypoint (используем интерполированный depth)
                 z = 0
-                if depth is not None and 0 <= abs_py < depth.shape[0] and 0 <= abs_px < depth.shape[1]:
-                    z = depth[abs_py, abs_px] * (7.5/65536)
+                if interpolated_depth is not None and 0 <= abs_py < interpolated_depth.shape[0] and 0 <= abs_px < interpolated_depth.shape[1]:
+                    z = interpolated_depth[abs_py, abs_px] * (7.5/65536)
                 
                 # Нормализуем координаты
                 my_x_normal = 640 - 1 - abs_px
