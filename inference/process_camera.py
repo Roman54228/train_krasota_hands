@@ -209,7 +209,7 @@ class CameraProcessor:
     
     def resolve_hand_conflicts(self, detections):
         """Разрешение конфликтов: не более одной левой и одной правой руки в кадре"""
-        if len(detections) <= 1:
+        if len(detections) <= 2:
             return detections
         
         # Проверяем детекции по типам
@@ -382,6 +382,8 @@ class CameraProcessor:
             x1, y1, x2, y2 = map(int, box.tolist())
             cls = int(results[0].boxes.cls[i].item())
             confidence = float(results[0].boxes.conf[i].item())
+            if confidence < 0.5:
+                continue
             
             # Назначаем track_id
             box_coords = box.tolist()
@@ -564,7 +566,7 @@ class CameraProcessor:
             # Рисуем линию и bounding box
             cv2.line(draw_image, (0, 550), (550, 550), color, 2)
             cv2.rectangle(draw_image, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(draw_image, f'id:{track_id}', (x1, y1 - 10),
+            cv2.putText(draw_image, f'id:{track_id}, {detection['yolo_class']}', (x1, y1 - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         return draw_image, list_src_crops
@@ -657,16 +659,16 @@ class CameraProcessor:
                 # Отображение результата
                 cv2.imshow("Hand Detection", processed_image)
                 
-                # Показываем оригинальное изображение
-                if len(image.shape) == 2:
-                    cv2.imshow("Original IR", image)
-                else:
-                    cv2.imshow("Original IR", cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
+                # # Показываем оригинальное изображение
+                # if len(image.shape) == 2:
+                #     cv2.imshow("Original IR", image)
+                # else:
+                #     cv2.imshow("Original IR", cv2.cvtColor(image, cv2.COLOR_BGR2GRAY))
                 
-                # Нормализация depth для визуализации
-                if depth is not None:
-                    depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
-                    cv2.imshow("Depth", depth_normalized)
+                # # Нормализация depth для визуализации
+                # if depth is not None:
+                #     depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+                #     cv2.imshow("Depth", depth_normalized)
                 
                 cv2.imwrite(f'roma_images/{jjj}.png', processed_image)
                 
@@ -684,7 +686,7 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Обработка видео с камеры для детекции рук')
-    parser.add_argument('--yolo', type=str, default="/home/cineai/ViduSdk/python/TRT_Roma/newone/upside.engine",
+    parser.add_argument('--yolo', type=str, default="yolo_new_lr.engine",
                         help='Путь к YOLO модели')
     parser.add_argument('--trt', type=str, default="my_model.engine",
                         help='Путь к TensorRT модели классификации')
