@@ -446,7 +446,7 @@ class CameraProcessor:
             x1, y1, x2, y2 = map(int, box.tolist())
             cls = int(results[0].boxes.cls[i].item())
             confidence = float(results[0].boxes.conf[i].item())
-            if confidence < 0.5:
+            if confidence < 0.4:
                 continue
             
             # Назначаем track_id
@@ -574,7 +574,8 @@ class CameraProcessor:
                 'crop_w': w
             })
         
-        # Интерполируем depth для каждой руки
+        # Интерполируем depth для каждоend(address=f"/hand_{yolo_class_name}/keypoint_{p_id}", data=[real_x, real_y, real_z])
+                # if p_id == 3:й руки
         interpolated_depth = depth.copy() if depth is not None else None
         if interpolated_depth is not None:
             for hand_data in hands_data:
@@ -666,7 +667,12 @@ class CameraProcessor:
                 my_x_normal = 640 - 1 - abs_px
                 my_y_normal = 480 - 1 - abs_py
                 real_x, real_y, real_z = self.coord_transformer.pixel_to_floor_3d(my_x_normal, my_y_normal, z)
-                
+                if p_id == 0:
+                    cv2.putText(draw_image, f'{real_z:.3f}', (x2, y1 + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                if p_id == 20:
+                    cv2.putText(draw_image, f'{real_z:.3f}', (x2, y1 + 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 # Отправка каждой keypoint отдельно с классом руки
                 self.sender.send(address=f"/hand_{yolo_class_name}/keypoint_{p_id}", data=[real_x, real_y, real_z])
             
