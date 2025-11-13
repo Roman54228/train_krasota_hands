@@ -47,7 +47,8 @@ class CameraProcessor:
     
     def __init__(self, yolo_model_path: str, trt_model_path: str, kps_model_path: str, 
                  osc_ip: str = "10.0.0.101", osc_port: int = 5055, 
-                 use_depth_interpolation: bool = True):
+                 use_depth_interpolation: bool = True,
+                 interpolation_method: str = "hull"):
         # Инициализация координатного трансформера
         self.coord_transformer = CoordinateTransformer()
         
@@ -56,7 +57,10 @@ class CameraProcessor:
         
         # Флаг использования интерполяции depth
         self.use_depth_interpolation = use_depth_interpolation
+        self.interpolation_method = interpolation_method  # "hull" или "skeleton"
         print(f"Depth interpolation: {'enabled' if use_depth_interpolation else 'disabled'}")
+        if use_depth_interpolation:
+            print(f"Interpolation method: {interpolation_method}")
         
         # Загрузка моделей
         print("Загрузка YOLO модели...")
@@ -356,7 +360,7 @@ class CameraProcessor:
     
     def interpolate_hand_depth(self, depth, keypoints, reference_depth):
         """
-        Интерполяция depth в области руки
+        Интерполяция depth в области руки (метод 1: convex hull)
         
         Args:
             depth: depth карта
@@ -418,6 +422,124 @@ class CameraProcessor:
                     depth_copy = np.where(mask > 0, depth_copy_smoothed, depth_copy)
         
         return depth_copy.astype(depth.dtype), mask, hull
+    
+    def interpolate_hand_depth_skeleton(self, depth, keypoints, keypoints_depth_values):
+        """
+        Интерполяция depth вдоль скелета руки (метод 2: skeleton dilation)
+        
+        Расширяет depth значения вдоль всех соединений скелета руки,
+        заполняя промежутки между пальцами.
+        
+        Args:
+            depth: depth карта
+            keypoints: список координат keypoints [(x, y), ...] (21 точка)
+            keypoints_depth_values: список depth значений для каждой keypoint
+        
+        Returns:
+            tuple: (depth карта с интерполированными значениями, маска скелета)
+        """
+        if depth is None or len(keypoints) == 0 or len(keypoints) != 21:
+            return depth, None
+        
+        depth_copy = depth.copy().astype(np.float32)
+        h, w = depth.shape[:2]
+        
+        # Создаем маску для скелета
+        skeleton_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        # Создаем depth карту для скелета
+        skeleton_depth = np.zeros((h, w), dtype=np.float32)
+        
+        # Соединения скелета руки (21 точка)
+        connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),      # Большой палец
+            (0, 5), (5, 6), (6, 7), (7, 8),      # Указательный
+            (0, 9), (9, 10), (10, 11), (11, 12), # Средний
+            (0, 13), (13, 14), (14, 15), (15, 16), # Безымянный
+            (0, 17), (17, 18), (18, 19), (19, 20), # Мизинец
+            (5, 9), (9, 13), (13, 17)            # Соединения между пальцами
+        ]
+        
+        # Рисуем толстые линии вдоль скелета с depth значениями
+        line_thickness = 12  # Толщина линий для "раздувания" руки
+        
+        for start_idx, end_idx in connections:
+            if start_idx < len(keypoints) and end_idx < len(keypoints):
+                pt1 = keypoints[start_idx]
+                pt2 = keypoints[end_idx]
+                
+                # Проверяем что точки валидны
+                if (0 <= pt1[0] < w and 0 <= pt1[1] < h and 
+                    0 <= pt2[0] < w and 0 <= pt2[1] < h):
+                    
+                    # Рисуем толстую линию на маске
+                    cv2.line(skeleton_mask, pt1, pt2, 255, thickness=line_thickness)
+                    
+                    # Интерполируем depth значения вдоль линии
+                    depth_start = keypoints_depth_values[start_idx]
+                    depth_end = keypoints_depth_values[end_idx]
+                    
+                    # Создаем временную маску для этой линии
+                    temp_mask = np.zeros((h, w), dtype=np.uint8)
+                    cv2.line(temp_mask, pt1, pt2, 255, thickness=line_thickness)
+                    
+                    # Заполняем depth значения вдоль линии с линейной интерполяцией
+                    line_pixels = np.where(temp_mask > 0)
+                    if len(line_pixels[0]) > 0:
+                        for y, x in zip(line_pixels[0], line_pixels[1]):
+                            # Вычисляем расстояние от start к end
+                            total_dist = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
+                            if total_dist > 0:
+                                current_dist = np.sqrt((x - pt1[0])**2 + (y - pt1[1])**2)
+                                t = current_dist / total_dist  # 0 в start, 1 в end
+                                
+                                # Линейная интерполяция depth
+                                interpolated_depth = depth_start * (1 - t) + depth_end * t
+                                
+                                # Обновляем только если это значение больше текущего (ближе к камере)
+                                if skeleton_depth[y, x] == 0 or interpolated_depth > skeleton_depth[y, x]:
+                                    skeleton_depth[y, x] = interpolated_depth
+        
+        # Рисуем круги в местах keypoints для большей толщины
+        for idx, (kp, depth_val) in enumerate(zip(keypoints, keypoints_depth_values)):
+            if 0 <= kp[0] < w and 0 <= kp[1] < h and depth_val > 0:
+                cv2.circle(skeleton_mask, kp, line_thickness // 2, 255, -1)
+                cv2.circle(skeleton_depth.astype(np.float32), kp, line_thickness // 2, float(depth_val), -1)
+        
+        # Расширяем скелет еще больше через dilation
+        kernel = np.ones((15, 15), np.uint8)
+        skeleton_mask_dilated = cv2.dilate(skeleton_mask, kernel, iterations=2)
+        
+        # Заполняем расширенные области через inpainting
+        # Сначала создаем маску где нужно заполнить (расширенная область минус исходный скелет)
+        fill_mask = cv2.bitwise_and(skeleton_mask_dilated, cv2.bitwise_not(skeleton_mask))
+        
+        # Применяем скелетный depth к основной depth карте
+        depth_result = depth_copy.copy()
+        
+        # В местах где есть скелет, используем интерполированные значения
+        skeleton_pixels = np.where(skeleton_mask > 0)
+        for y, x in zip(skeleton_pixels[0], skeleton_pixels[1]):
+            if skeleton_depth[y, x] > 0:
+                depth_result[y, x] = skeleton_depth[y, x]
+        
+        # Заполняем расширенные области через размытие
+        if np.any(fill_mask > 0):
+            # Конвертируем в правильный формат для inpaint
+            depth_for_inpaint = depth_result.astype(np.float32)
+            depth_inpainted = cv2.inpaint(depth_for_inpaint, fill_mask, inpaintRadius=10, flags=cv2.INPAINT_TELEA)
+            
+            # Применяем результат
+            fill_pixels = np.where(fill_mask > 0)
+            for y, x in zip(fill_pixels[0], fill_pixels[1]):
+                depth_result[y, x] = depth_inpainted[y, x]
+        
+        # Сглаживаем результат в области скелета
+        mask_for_blur = skeleton_mask_dilated
+        depth_smoothed = cv2.GaussianBlur(depth_result, (7, 7), 0)
+        depth_result = np.where(mask_for_blur > 0, depth_smoothed, depth_result)
+        
+        return depth_result.astype(depth.dtype), skeleton_mask_dilated
     
     def process_frame(self, image, depth=None):
         """Обработка одного кадра"""
@@ -555,8 +677,9 @@ class CameraProcessor:
             preds = preds[0]
             h, w, _ = list_src_crops[i].shape
             
-            # Собираем все абсолютные координаты keypoints
+            # Собираем все абсолютные координаты keypoints и их depth значения
             abs_keypoints = []
+            keypoints_depth_values = []
             reference_depth = 0
             
             for p_id, (x_norm, y_norm) in enumerate(preds):
@@ -567,14 +690,21 @@ class CameraProcessor:
                 abs_py = y1 + py
                 abs_keypoints.append((abs_px, abs_py))
                 
-                # Получаем reference depth от точки p_id == 0 (основание ладони)
-                if p_id == 0 and depth is not None:
+                # Получаем depth значение для каждой keypoint
+                kp_depth = 0
+                if depth is not None:
                     if 0 <= abs_py < depth.shape[0] and 0 <= abs_px < depth.shape[1]:
-                        reference_depth = depth[abs_py, abs_px] * (DEPTH_LEN/65536)
+                        kp_depth = depth[abs_py, abs_px]
+                keypoints_depth_values.append(kp_depth)
+                
+                # Получаем reference depth от точки p_id == 0 (основание ладони)
+                if p_id == 0 and kp_depth > 0:
+                    reference_depth = kp_depth * (DEPTH_LEN/65536)
             
             hands_data.append({
                 'detection': detection,
                 'keypoints': abs_keypoints,
+                'keypoints_depth_values': keypoints_depth_values,
                 'reference_depth': reference_depth,
                 'preds': preds,
                 'crop_h': h,
@@ -588,16 +718,33 @@ class CameraProcessor:
         
         if self.use_depth_interpolation and interpolated_depth is not None:
             for hand_data in hands_data:
-                if hand_data['reference_depth'] > 0:
-                    interpolated_depth, mask, hull = self.interpolate_hand_depth(
-                        interpolated_depth,
-                        hand_data['keypoints'],
-                        hand_data['reference_depth']
-                    )
-                    if mask is not None:
-                        interpolation_masks.append(mask)
-                    if hull is not None:
-                        interpolation_hulls.append(hull)
+                if self.interpolation_method == "skeleton":
+                    # Метод 2: интерполяция вдоль скелета
+                    if len(hand_data['keypoints']) == 21:
+                        interpolated_depth, mask = self.interpolate_hand_depth_skeleton(
+                            interpolated_depth,
+                            hand_data['keypoints'],
+                            hand_data['keypoints_depth_values']
+                        )
+                        if mask is not None:
+                            interpolation_masks.append(mask)
+                            # Для визуализации создаем hull из keypoints
+                            kp_array = np.array(hand_data['keypoints'], dtype=np.int32)
+                            if len(kp_array) >= 3:
+                                hull = cv2.convexHull(kp_array)
+                                interpolation_hulls.append(hull)
+                else:
+                    # Метод 1: интерполяция через convex hull (по умолчанию)
+                    if hand_data['reference_depth'] > 0:
+                        interpolated_depth, mask, hull = self.interpolate_hand_depth(
+                            interpolated_depth,
+                            hand_data['keypoints'],
+                            hand_data['reference_depth']
+                        )
+                        if mask is not None:
+                            interpolation_masks.append(mask)
+                        if hull is not None:
+                            interpolation_hulls.append(hull)
         
         # Выбираем какой depth использовать
         final_depth = interpolated_depth if self.use_depth_interpolation else depth
@@ -702,24 +849,31 @@ class CameraProcessor:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         # Визуализация областей интерполяции (только если включено)
-        if self.use_depth_interpolation and len(interpolation_hulls) > 0:
+        if self.use_depth_interpolation and len(interpolation_masks) > 0:
             # Создаем полупрозрачный оверлей для областей интерполяции
             overlay = draw_image.copy()
             
-            for i, hull in enumerate(interpolation_hulls):
-                # Рисуем заполненный hull полупрозрачным цветом
-                cv2.fillPoly(overlay, [hull], (0, 255, 255))  # Желтый цвет для области
-                
-                # Рисуем контур hull
-                cv2.polylines(draw_image, [hull], True, (0, 255, 255), 2)
+            # Выбираем цвет в зависимости от метода
+            color = (0, 255, 255) if self.interpolation_method == "hull" else (255, 0, 255)  # Желтый или Пурпурный
             
-            # Смешиваем оверлей с основным изображением (30% прозрачность)
-            alpha = 0.3
-            draw_image = cv2.addWeighted(overlay, alpha, draw_image, 1 - alpha, 0)
+            # Рисуем маски интерполяции
+            for mask in interpolation_masks:
+                # Применяем маску с цветом
+                colored_mask = np.zeros_like(overlay)
+                colored_mask[mask > 0] = color
+                overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.3, 0)
+            
+            # Рисуем контуры hull для лучшей видимости
+            for hull in interpolation_hulls:
+                cv2.polylines(draw_image, [hull], True, color, 2)
+            
+            # Смешиваем с основным изображением
+            draw_image = overlay
             
             # Добавляем текст с пояснением
-            cv2.putText(draw_image, 'Yellow: Interpolation area (ON)', (10, image_h - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            method_text = "Hull" if self.interpolation_method == "hull" else "Skeleton"
+            cv2.putText(draw_image, f'Interpolation: {method_text} (ON)', (10, image_h - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         else:
             # Показываем что интерполяция выключена
             if not self.use_depth_interpolation:
@@ -863,6 +1017,8 @@ def main():
                         help='Порт для OSC отправки')
     parser.add_argument('--no-depth-interpolation', action='store_true',
                         help='Отключить интерполяцию depth (по умолчанию включена)')
+    parser.add_argument('--interpolation-method', type=str, default='skeleton', choices=['hull', 'skeleton'],
+                        help='Метод интерполяции depth: hull (convex hull) или skeleton (вдоль скелета, по умолчанию)')
     
     args = parser.parse_args()
     
@@ -873,7 +1029,8 @@ def main():
         kps_model_path=args.kps,
         osc_ip=args.osc_ip,
         osc_port=args.osc_port,
-        use_depth_interpolation=not args.no_depth_interpolation
+        use_depth_interpolation=not args.no_depth_interpolation,
+        interpolation_method=args.interpolation_method
     )
     
     # Запуск обработки
