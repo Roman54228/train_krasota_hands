@@ -66,10 +66,12 @@ class CameraProcessor:
         self.previous_detections = defaultdict(list)
         
         # Система трекинга рук
-        self.hand_tracks = {}  # {track_id: {'hand_type': 'left'/'right'/'twohands', 'confidence_history': [], 'frames_count': 0}}
+        self.hand_tracks = {}  # {track_id: {'hand_type': 'left'/'right'/'twohands', 'confidence_history': [], 'frames_count': 0, 'frames_since_last_seen': 0}}
         self.next_track_id = 0
         self.min_frames_for_stable_classification = 5  # Минимум кадров для стабильной классификации
         self.max_confidence_history = 10  # Максимум кадров истории для усреднения
+        self.max_tracks_to_display = 2  # Максимум треков для отображения
+        self.max_inactive_frames = 15  # Максимум кадров неактивности перед удалением трека
         
         # Параметры обработки
         self.CROP_SIZE = 256
@@ -114,39 +116,80 @@ class CameraProcessor:
         smoothed_box = np.mean(self.previous_detections[track_id], axis=0).astype(int)
         return smoothed_box
     
-    def assign_track_id(self, detection_box, yolo_class):
-        """Назначение track_id для новой детекции"""
-        # Простая логика назначения ID на основе позиции и класса
-        # В реальном проекте здесь должен быть более сложный трекинг
+    def calculate_iou(self, box1, box2):
+        """Вычисление IoU (Intersection over Union) между двумя боксами"""
+        x1_min, y1_min, x1_max, y1_max = box1
+        x2_min, y2_min, x2_max, y2_max = box2
         
-        # Проверяем существующие треки
+        # Вычисляем площадь пересечения
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        if inter_x_max < inter_x_min or inter_y_max < inter_y_min:
+            return 0.0
+        
+        inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+        
+        # Вычисляем площади боксов
+        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+        
+        # Вычисляем union
+        union_area = box1_area + box2_area - inter_area
+        
+        if union_area == 0:
+            return 0.0
+        
+        return inter_area / union_area
+    
+    def assign_track_id(self, detection_box, yolo_class):
+        """Назначение track_id для новой детекции с использованием IoU"""
+        detection_box = [float(x) for x in detection_box]
+        
+        best_track_id = None
+        best_iou = 0.0
+        iou_threshold = 0.3  # Минимальный IoU для сопоставления с существующим треком
+        
+        # Ищем трек с наибольшим IoU
         for track_id, track_info in self.hand_tracks.items():
-            if track_info['frames_count'] > 0:  # Трек активен
-                # Простая проверка пересечения боксов (можно улучшить)
-                # Пока используем простую логику - если трек недавно был активен, используем его ID
-                if track_info['frames_count'] < 10:  # Трек недавно активен
-                    return track_id
+            if track_info.get('last_box') is not None and track_info['frames_since_last_seen'] < 5:
+                iou = self.calculate_iou(detection_box, track_info['last_box'])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_track_id = track_id
+        
+        # Если нашли подходящий трек, возвращаем его ID
+        if best_track_id is not None and best_iou > iou_threshold:
+            return best_track_id
         
         # Создаем новый трек
         track_id = self.next_track_id
         self.next_track_id += 1
         return track_id
     
-    def update_hand_track(self, track_id, yolo_class, confidence):
+    def update_hand_track(self, track_id, yolo_class, confidence, detection_box):
         """Обновление информации о треке руки"""
         if track_id not in self.hand_tracks:
             self.hand_tracks[track_id] = {
                 'hand_type': None,
                 'confidence_history': [],
                 'frames_count': 0,
-                'stable_classification': None
+                'frames_since_last_seen': 0,  # Счетчик кадров с последнего появления
+                'stable_classification': None,
+                'last_box': None  # Последний бокс для трекинга
             }
         
         track_info = self.hand_tracks[track_id]
         
+        # Сохраняем последний бокс
+        track_info['last_box'] = detection_box
+        
         # Добавляем текущую классификацию в историю
         track_info['confidence_history'].append((yolo_class, confidence))
         track_info['frames_count'] += 1
+        track_info['frames_since_last_seen'] = 0  # Сбрасываем счетчик неактивности
         
         # Ограничиваем историю
         if len(track_info['confidence_history']) > self.max_confidence_history:
@@ -199,15 +242,38 @@ class CameraProcessor:
     
     def cleanup_inactive_tracks(self):
         """Очистка неактивных треков"""
+        # Увеличиваем счетчик неактивности для всех треков
+        for track_id, track_info in self.hand_tracks.items():
+            track_info['frames_since_last_seen'] += 1
+        
+        # Удаляем треки, которые не появлялись слишком долго
         inactive_tracks = []
         for track_id, track_info in self.hand_tracks.items():
-            if track_info['frames_count'] > 20:  # Трек неактивен более 20 кадров
+            if track_info['frames_since_last_seen'] > self.max_inactive_frames:
                 inactive_tracks.append(track_id)
         
         for track_id in inactive_tracks:
             del self.hand_tracks[track_id]
             if track_id in self.previous_detections:
                 del self.previous_detections[track_id]
+    
+    def filter_to_best_tracks(self, detections):
+        """Фильтрация детекций: оставляем только самые долгие треки"""
+        if len(detections) <= self.max_tracks_to_display:
+            return detections
+        
+        # Сортируем треки по длительности (frames_count) в убывающем порядке
+        sorted_tracks = sorted(self.hand_tracks.items(), key=lambda x: x[1]['frames_count'], reverse=True)
+        
+        # Берем top-N самых долгих треков
+        best_track_ids = {track_id for track_id, _ in sorted_tracks[:self.max_tracks_to_display]}
+        
+        print(f"DEBUG: Всего треков: {len(detections)}, Оставляем только 2 самых долгих: {best_track_ids}")
+        
+        # Фильтруем детекции
+        filtered_detections = [d for d in detections if d['track_id'] in best_track_ids]
+        
+        return filtered_detections
     
     def extract_camera_intrinsics(self, stream):
         """Извлечение параметров камеры"""
@@ -318,10 +384,11 @@ class CameraProcessor:
             confidence = float(results[0].boxes.conf[i].item())
             
             # Назначаем track_id
-            track_id = self.assign_track_id(box.tolist(), cls)
+            box_coords = box.tolist()
+            track_id = self.assign_track_id(box_coords, cls)
             
-            # Обновляем информацию о треке
-            self.update_hand_track(track_id, cls, confidence)
+            # Обновляем информацию о треке (передаем координаты бокса)
+            self.update_hand_track(track_id, cls, confidence, box_coords)
             
             # Добавляем детекцию в список
             detections.append({
@@ -337,6 +404,9 @@ class CameraProcessor:
         
         # Очищаем неактивные треки
         self.cleanup_inactive_tracks()
+        
+        # Оставляем только самые долгие треки (защита от ложных детекций)
+        detections = self.filter_to_best_tracks(detections)
         
         # Обрабатываем финальные детекции
         for detection in detections:
